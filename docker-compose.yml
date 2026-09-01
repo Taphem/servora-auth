@@ -1,0 +1,32 @@
+# Local development infrastructure only — Postgres + Redis. The service
+# itself runs via `npm run dev` against these, not as a container here, so
+# `tsx watch` keeps working. See README.md "Local development".
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: auth
+      POSTGRES_PASSWORD: auth
+      POSTGRES_DB: servora_auth
+    ports:
+      - '5432:5432'
+    volumes:
+      - servora-auth-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U auth']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  servora-auth-postgres:
