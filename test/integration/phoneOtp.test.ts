@@ -55,6 +55,9 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
     const event = testApp.notifications.events[0] as PhoneOtpRequestedEvent;
     expect(event.type).toBe('PhoneOtpRequested');
     expect(event.otp).toMatch(/^\d{6}$/);
+    // Matches servora-notification's documented phone-otp request body: expiresInSeconds, not expiresAt.
+    expect(event.expiresInSeconds).toBe(testApp.ctx.env.OTP_TTL_SECONDS);
+    expect(event).not.toHaveProperty('expiresAt');
 
     const verifyResponse = await testApp.app.inject({
       method: 'POST',

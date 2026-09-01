@@ -1,21 +1,21 @@
 /**
- * PROPOSED notification-delivery contract — NOT defined in servora-docs.
+ * Notification-delivery contract — CONFIRMED against the deployed
+ * servora-notification service (see servora-notification/docs/api.md and
+ * docs/integration.md). Three resource-oriented internal endpoints under
+ * `/internal/v1/notifications/*`, each requiring `x-servora-internal-key`.
+ * `type` here is an internal TypeScript discriminator only — it is never
+ * sent in the outbound JSON body (see notificationRequest.ts, which maps
+ * each event to the exact path + body servora-notification expects).
+ * `requestId` is likewise internal-only, sent as the `x-request-id` header
+ * rather than a body field, for tracing continuity with that service's own
+ * request-ID-bearing error envelope.
  *
- * service-boundaries.md assigns "Email/SMS/push delivery" to
- * servora-notification, and communication.md classifies email/SMS as
- * asynchronous work. servora-notification does not exist yet, so this
- * shape is a proposal for Auth's outbound side only, not a confirmed
- * cross-service contract. See README.md "Notification integration
- * boundary" for the full rationale and what would need to change once
- * servora-notification actually defines its intake contract (most likely
- * a RabbitMQ event per event-architecture.md, rather than the HTTP POST
- * used here as an honest stand-in).
- *
- * Deliberately excluded from every event payload: the raw token/OTP is
- * never placed in a durable/broadcast structure. It is passed only as a
- * single HTTP request body to a specific configured endpoint, mirroring
- * how the API Gateway treats an unconfigured/unreachable downstream —
- * never logged, never persisted by this service beyond the request.
+ * Deliberately excluded from every request body: anything not in
+ * servora-notification's documented schema. The raw token/OTP is passed
+ * once, directly in the body of a single authenticated internal call —
+ * never logged (see HttpNotificationPublisher.ts), never placed in a
+ * durable/broadcast structure, never persisted by this service beyond the
+ * request.
  */
 
 export type NotificationEventType =
@@ -29,7 +29,6 @@ export interface EmailVerificationRequestedEvent {
   userId: string;
   email: string;
   verificationToken: string;
-  expiresAt: string;
 }
 
 export interface PhoneOtpRequestedEvent {
@@ -38,7 +37,7 @@ export interface PhoneOtpRequestedEvent {
   userId: string;
   phone: string;
   otp: string;
-  expiresAt: string;
+  expiresInSeconds: number;
 }
 
 export interface PasswordResetRequestedEvent {
@@ -47,7 +46,6 @@ export interface PasswordResetRequestedEvent {
   userId: string;
   email: string;
   resetToken: string;
-  expiresAt: string;
 }
 
 export type NotificationEvent =

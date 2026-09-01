@@ -75,7 +75,7 @@ export function registerPhoneOtpRequestRoute(app: FastifyInstance, ctx: AppConte
       userId: user.id,
       phone: body.phone,
       otp,
-      expiresAt: expiresAt.toISOString(),
+      expiresInSeconds: ctx.env.OTP_TTL_SECONDS,
     });
 
     return { requested: true, expiresInSeconds: ctx.env.OTP_TTL_SECONDS };

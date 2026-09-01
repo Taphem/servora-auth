@@ -56,6 +56,9 @@ describe.skipIf(!isInfraAvailable())('password reset', () => {
       payload: { email: 'fullflow@example.com' },
     });
     const event = testApp.notifications.events.find((e) => e.type === 'PasswordResetRequested') as PasswordResetRequestedEvent;
+    // Matches servora-notification's documented password-reset request body exactly.
+    expect(event).toMatchObject({ userId: expect.any(String), email: 'fullflow@example.com' });
+    expect(event).not.toHaveProperty('expiresAt');
 
     const confirmResponse = await testApp.app.inject({
       method: 'POST',

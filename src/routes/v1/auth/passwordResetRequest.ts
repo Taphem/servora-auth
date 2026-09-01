@@ -54,7 +54,6 @@ export function registerPasswordResetRequestRoute(app: FastifyInstance, ctx: App
       userId: user.id,
       email: user.email,
       resetToken: rawToken,
-      expiresAt: expiresAt.toISOString(),
     });
 
     return GENERIC_RESPONSE;

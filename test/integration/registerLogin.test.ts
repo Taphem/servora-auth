@@ -36,7 +36,15 @@ describe.skipIf(!isInfraAvailable())('register + login + logout + session', () =
     expect(sessionCookie).toBeTruthy();
 
     expect(testApp.notifications.events).toHaveLength(1);
-    expect(testApp.notifications.events[0]?.type).toBe('EmailVerificationRequested');
+    const event = testApp.notifications.events[0];
+    expect(event).toMatchObject({
+      type: 'EmailVerificationRequested',
+      userId: body.userId,
+      email: 'alice@example.com',
+    });
+    expect(typeof (event as { verificationToken?: unknown }).verificationToken).toBe('string');
+    // Matches servora-notification's documented request body exactly — no expiresAt field.
+    expect(event).not.toHaveProperty('expiresAt');
   });
 
   it('rejects registration with a password shorter than 10 characters', async () => {

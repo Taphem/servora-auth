@@ -53,7 +53,6 @@ export function registerEmailResendRoute(app: FastifyInstance, ctx: AppContext):
       userId: user.id,
       email: user.email,
       verificationToken: rawToken,
-      expiresAt: expiresAt.toISOString(),
     });
 
     return GENERIC_RESPONSE;

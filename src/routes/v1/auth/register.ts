@@ -62,7 +62,6 @@ export function registerRegisterRoute(app: FastifyInstance, ctx: AppContext): vo
       userId: user.id,
       email: user.email,
       verificationToken: rawToken,
-      expiresAt: expiresAt.toISOString(),
     });
 
     const { rawToken: sessionToken } = await createSession(ctx.pool, {

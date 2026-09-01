@@ -20,6 +20,7 @@ async function main(): Promise<void> {
   const notificationPublisher: NotificationPublisher = env.notificationConfigured
     ? new HttpNotificationPublisher({
         baseUrl: env.NOTIFICATION_SERVICE_URL!,
+        internalServiceKey: env.INTERNAL_SERVICE_KEY,
         timeoutMs: env.NOTIFICATION_SERVICE_TIMEOUT_MS,
         logger,
       })

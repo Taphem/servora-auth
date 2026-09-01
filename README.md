@@ -204,24 +204,36 @@ Missing or incorrect `x-servora-internal-key` is a `401 INTERNAL_AUTH_FAILED` (n
 
 This is documented here, in this repository, as instructed — `servora-docs` was not modified.
 
-## Notification integration boundary — PROPOSED contract
+## Notification integration boundary — CONFIRMED contract
 
-`servora-docs/02-architecture/service-boundaries.md` assigns "Email/SMS/push delivery" to
-`servora-notification`, and `communication.md` classifies email/SMS as asynchronous work.
-`servora-notification` does not exist yet, so there is no contract to confirm against. This
-service defines its **outbound** side only (`src/notifications/`):
+`servora-notification` is deployed and its internal HTTP contract is documented in that
+repository (`servora-notification/docs/api.md`, `docs/integration.md`). This service's outbound
+side (`src/notifications/`) was updated to match it exactly — it is no longer a proposal:
 
-- `NotificationPublisher` — the interface every call site depends on (`publish(event)`).
-- `NotificationEvent` (`src/notifications/events.ts`) — three PROPOSED event shapes:
-  `EmailVerificationRequested`, `PhoneOtpRequested`, `PasswordResetRequested`. Each carries the
-  raw token/OTP once, to a single destination — never placed in a durable, multi-consumer,
-  broadcast structure, and never logged (see "Security" below).
-- `HttpNotificationPublisher` — a real, working HTTP POST to
-  `${NOTIFICATION_SERVICE_URL}/internal/v1/events`. This is an honest stand-in for what the
-  documented long-term mechanism is more likely to be (an async RabbitMQ event, per
-  `event-architecture.md`), chosen because RabbitMQ isn't wired up at this milestone and
-  `servora-notification` doesn't exist to define an intake contract yet. Swapping the transport
-  later means writing a new `NotificationPublisher` implementation, not touching any call site.
+- `NotificationPublisher` — the interface every call site depends on (`publish(event)`),
+  unchanged by this update.
+- `NotificationEvent` (`src/notifications/events.ts`) — three internal TypeScript-only shapes
+  (`EmailVerificationRequested`, `PhoneOtpRequested`, `PasswordResetRequested`); `type` and
+  `requestId` are never sent in the outbound body — see `notificationRequest.ts`.
+- `toNotificationHttpRequest` (`src/notifications/notificationRequest.ts`) — pure mapping from an
+  internal event to the exact `{ path, body }` servora-notification documents for each of its
+  three resource-oriented endpoints:
+
+  | Auth-side trigger | Call into servora-notification | Body |
+  |---|---|---|
+  | `POST /register`, `POST /email/resend` | `POST /internal/v1/notifications/email-verification` | `{ userId, email, verificationToken }` |
+  | `POST /password/reset/request` | `POST /internal/v1/notifications/password-reset` | `{ userId, email, resetToken }` |
+  | `POST /phone/otp/request` | `POST /internal/v1/notifications/phone-otp` | `{ userId, phone, otp, expiresInSeconds }` |
+
+- `HttpNotificationPublisher` — sends `x-servora-internal-key: <INTERNAL_SERVICE_KEY>` (the same
+  shared secret used on the internal session-verify endpoint) and `x-request-id: <requestId>` on
+  every call, to `${NOTIFICATION_SERVICE_URL}<path>`. Success is `202 { accepted: true }`. A
+  non-2xx response, an unreachable service, or a malformed/unexpected response body is logged as a
+  warning (HTTP status, servora-notification's own error `code` when present, event type, request
+  ID) and **swallowed, never thrown** — the token/OTP is already durably persisted in Postgres
+  before this call happens, so a delivery failure never blocks or fails the calling auth flow; the
+  user can always retry via `/email/resend` or a fresh `/phone/otp/request`. Never logged, under
+  any outcome: `INTERNAL_SERVICE_KEY`, the raw token/OTP, or the request/response body.
 - `NullNotificationPublisher` — used when `NOTIFICATION_SERVICE_URL` is unset. The verification/
   reset challenge is still created and persisted in Postgres; it just isn't delivered anywhere. A
   warning is logged (event type + request ID only, never the payload). This mirrors the API
@@ -229,12 +241,14 @@ service defines its **outbound** side only (`src/notifications/`):
 - `InMemoryNotificationPublisher` — test double; used throughout `test/integration/` to assert on
   exactly what would have been sent, without a network call.
 
-**Not claimed as production-ready:** no real email/SMS ever gets sent by this service today. There
-is no `servora-notification` deployment to point `NOTIFICATION_SERVICE_URL` at yet. Until that
-service exists and its intake contract is confirmed (and possibly renegotiated — this one is
-explicitly proposed, not agreed), verification/reset flows are only observable by whoever/whatever
-is registered as the `NotificationPublisher` (a real HTTP endpoint, or, in tests, the in-memory
-capture).
+**History:** this was previously a PROPOSED, unconfirmed contract — a single generic
+`POST {baseUrl}/internal/v1/events` endpoint with a `type`-discriminated envelope, no internal-auth
+header, and `expiresAt` ISO timestamps. `servora-notification` was built independently to its own
+specified contract (three resource-oriented endpoints, `x-servora-internal-key` required,
+`expiresInSeconds` for the OTP flow — a deliberate, more security-conscious choice on that
+repository's part, documented in its `docs/integration.md` "Known contract mismatch" section as of
+before this update). This service has now been updated to match that contract exactly, rather than
+the other way around — `servora-notification` was not modified as part of this work.
 
 ## Database schema
 
@@ -445,8 +459,4 @@ plus a separate job building the Docker image. It does not deploy anywhere.
 - No scheduled cleanup of expired tokens/OTPs/revoked sessions (see "Database schema").
 - The API Gateway does not yet send `x-servora-internal-key` — that repository was not modified as
   part of this work (see "Internal session verification").
-- No real `servora-notification` deployment exists to receive the proposed HTTP event contract —
-  see "Notification integration boundary."
 - No CSRF token scheme beyond `SameSite=Lax` — see "Session / cookie architecture."
-#   s e r v o r a - a u t h  
- 
