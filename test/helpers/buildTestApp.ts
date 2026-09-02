@@ -16,8 +16,14 @@ export interface TestApp {
   close: () => Promise<void>;
 }
 
-/** Requires TEST_DATABASE_URL / TEST_REDIS_URL — see test/integration/README or vitest skip guards. */
-export function buildTestApp(): TestApp {
+/**
+ * Requires TEST_DATABASE_URL / TEST_REDIS_URL — see test/integration/README
+ * or vitest skip guards. `envOverrides` lets a test point specific env vars
+ * at a fixed value (e.g. a fake GOOGLE_CLIENT_ID for a mocked-verification
+ * test, or '' to exercise the "not configured" degrade path) without
+ * touching whatever the real environment/.env happens to have set.
+ */
+export function buildTestApp(envOverrides: Record<string, string> = {}): TestApp {
   const env = loadEnv({
     ...process.env,
     NODE_ENV: 'test',
@@ -25,6 +31,7 @@ export function buildTestApp(): TestApp {
     REDIS_URL: process.env['TEST_REDIS_URL'] ?? process.env['REDIS_URL'] ?? '',
     INTERNAL_SERVICE_KEY: TEST_INTERNAL_SERVICE_KEY,
     LOG_LEVEL: 'silent',
+    ...envOverrides,
   });
 
   const pool = createPool(env.DATABASE_URL);

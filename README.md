@@ -141,8 +141,9 @@ Public API is served under `/api/v1/`, per `servora-docs/09-api/versioning.md`. 
 | `POST /email/resend` | — | Body: `{ email }`. Identical generic response whether or not the account exists |
 | `POST /phone/otp/request` | session cookie | Body: `{}` — **no `phone` field**; the destination number is always the account's own stored phone (`400 PHONE_NOT_SET` if none) |
 | `POST /phone/otp/verify` | session cookie | Body: `{ otp }` — no `phone` field; derived from the pending challenge |
-| `GET /google/start` | — | 302 redirect to Google, or `503 GOOGLE_OAUTH_NOT_CONFIGURED` |
-| `GET /google/callback` | — | 302 redirect to `OAUTH_POST_LOGIN_REDIRECT_URL` on success |
+| `GET /google/start` | — | Authorization-code redirect flow. 302 to Google, or `503 GOOGLE_OAUTH_NOT_CONFIGURED` |
+| `GET /google/callback` | — | Authorization-code redirect flow. 302 redirect to `OAUTH_POST_LOGIN_REDIRECT_URL` on success |
+| `POST /google` | — | Body: `{ credential }` (Google ID token). "Continue with Google" for a frontend that obtains the credential directly (Identity Services button/One Tap) — see "Google authentication" |
 | `POST /password/reset/request` | — | Body: `{ email }`. Identical generic response either way |
 | `POST /password/reset/confirm` | — | Body: `{ token, newPassword }`. Revokes all existing sessions |
 
@@ -339,35 +340,63 @@ account" and "wrong password" (verified by `test/integration/registerLogin.test.
 `/email/resend` and `/password/reset/request` return byte-identical generic responses regardless
 of whether the account exists.
 
-## Google OAuth flow
+## Google authentication
 
-`GET /google/start` → builds a Google authorization URL with PKCE (`code_challenge`/`S256`),
-`state`, and `nonce`, all via `openid-client`'s real discovery against
-`https://accounts.google.com`; persists `{codeVerifier, nonce}` in Redis keyed by `state`
-(single-use, 10-minute TTL) → redirects the browser.
+Two backend entry points exist, both ending at the same shared identity-resolution and
+session-creation logic (`resolveOrCreateUserForGoogleIdentity`, `src/auth/googleIdentityService.ts`)
+— neither is a "signup-only" flow, and which one a given frontend uses doesn't change the account
+behavior described below.
 
-`GET /google/callback` → consumes the stored state (rejects replay), exchanges the code, and
-verifies the ID token against Google's own discovery document — this is genuine OpenID Connect,
-never a mock. `resolveOrCreateUserForGoogleIdentity` (`src/auth/googleIdentityService.ts`) then:
+**`POST /api/v1/auth/google`** — for a frontend that obtains a Google ID token *directly* (Google
+Identity Services "Sign in with Google" button / One Tap), without any page redirect. Body:
+`{ credential: "<Google ID token>" }`. The token is verified server-side with `google-auth-library`
+(`src/oauth/googleIdTokenVerifier.ts`) — real signature verification against Google's published
+keys, plus issuer, audience (`aud` must equal `GOOGLE_CLIENT_ID`), and expiration checks, never a
+mock. On success it calls the same `resolveOrCreateUserForGoogleIdentity` used below and creates a
+normal session. This is the endpoint a "Continue with Google" button should call.
 
-1. If `(google, sub)` is already linked → log in as that user.
+**`GET /google/start` + `GET /google/callback`** — the pre-existing authorization-code redirect
+flow, unchanged and still available for a redirect-based integration. `/start` builds a Google
+authorization URL with PKCE (`code_challenge`/`S256`), `state`, and `nonce` via `openid-client`'s
+real discovery against `https://accounts.google.com`, persists `{codeVerifier, nonce}` in Redis
+keyed by `state` (single-use, 10-minute TTL), and redirects the browser. `/callback` consumes the
+stored state (rejects replay), exchanges the code, and verifies the ID token against Google's own
+discovery document.
+
+**The button is mode-less, by design.** Neither endpoint accepts (or needs) a `mode`/`signup`/
+`login` field — "authenticate me with this Google identity" is the entire contract, whether the
+identity already has a Servora account or not:
+
+1. If `(google, sub)` is already linked → authenticate that existing user. No new account, no new
+   `oauth_identities` row, no "already registered" error — this is true regardless of whether the
+   caller conceptually arrived from a Login or Signup page, since the endpoint has no way to know
+   or care which.
 2. Else, if Google reports `email_verified: true` and an existing password account has that exact
-   email → **auto-link** (safe because Google's `email_verified` claim is trustworthy) and mark
-   the account's email verified if it wasn't already — "don't ask users to verify an email Google
-   already authenticated."
+   email → **safely auto-link** (justified because Google's `email_verified` claim is
+   cryptographically backed, not browser-supplied) and mark the account's email verified if it
+   wasn't already — "don't ask users to verify an email Google already authenticated." Then
+   authenticate that account immediately. No duplicate account is ever created for a matching
+   email, and a manual `POST /register` with that same email is completely unaffected by this —
+   see "Authentication flows" for why those two paths stay independent.
 3. Else → create a brand-new Google-only account (`password_hash: null`, `phone: null`,
-   `email_verified_at: now()`, `phone_verified_at: null`) — Google never supplies a phone number,
-   and none is invented; this function never touches `phone`/`phone_verified_at` at all. Phone
-   remains entirely optional here exactly as for password registration (see "Authentication
-   flows") — a Google account is never required to add or verify one.
-4. If Google reports `email_verified: false`, linking/account-creation is refused outright
-   (`401 GOOGLE_OAUTH_FAILED`) rather than trusting an unverified email.
+   `email_verified_at: now()`, `phone_verified_at: null`) and authenticate it immediately — Google
+   never supplies a phone number, and none is invented; phone stays entirely optional here exactly
+   as for password registration (see "Authentication flows"). No OTP is sent.
+4. If Google reports `email_verified: false` for an identity with no existing link, linking/account
+   creation is refused outright (`401 GOOGLE_OAUTH_FAILED`) rather than trusting an unverified
+   email — an already-linked identity's subsequent logins don't re-check this.
 
-`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`GOOGLE_REDIRECT_URI` are all-or-nothing
-(`env.googleOAuthConfigured`); if any is missing, both routes return `503
-GOOGLE_OAUTH_NOT_CONFIGURED` rather than behaving unpredictably. **No fake Google login exists
-anywhere in this codebase** — without real Google credentials, the feature is simply unavailable
-in an honestly-reported way, not stubbed.
+`GOOGLE_CLIENT_ID` is the single source of truth for both flows — the authorization-code flow
+additionally needs `GOOGLE_CLIENT_SECRET`/`GOOGLE_REDIRECT_URI` (`env.googleOAuthConfigured`,
+gates `/start` + `/callback`), while the ID-token endpoint needs only the client ID
+(`env.googleIdTokenVerificationConfigured`, gates `POST /google`) since there's no code exchange
+or redirect involved — no second/duplicate client ID variable was introduced. Either gate missing
+returns `503 GOOGLE_OAUTH_NOT_CONFIGURED` rather than behaving unpredictably. **No fake Google
+login exists anywhere in this codebase** — without real Google credentials, the feature is simply
+unavailable in an honestly-reported way, not stubbed. Google ID tokens, access tokens, and
+credentials are never logged (`src/observability/logger.ts` redaction) and Google access/refresh
+tokens are never persisted — the authorization-code flow discards them once the ID token's claims
+are extracted, and the ID-token endpoint never receives one in the first place.
 
 ## Email verification flow
 
@@ -456,9 +485,15 @@ never reach a browser, frontend build, or public log line.
   an occasional missed `EXPIRE` self-heals on the next window (see code comment).
 - **Logging:** `pino` redaction (`src/observability/logger.ts`) strips `authorization`, `cookie`,
   `set-cookie`, `x-servora-internal-key` headers, and any field named `password`, `newPassword`,
-  `token`, `sessionToken`, `otp`, `otpCode`, `internalServiceKey` from every log line.
-  `NotificationPublisher` implementations only ever log event *type* and *request ID*, never the
-  event body (which may contain a raw token/OTP).
+  `token`, `sessionToken`, `otp`, `otpCode`, `internalServiceKey`, `credential` from every log
+  line. `NotificationPublisher` implementations only ever log event *type* and *request ID*, never
+  the event body (which may contain a raw token/OTP).
+- **Google identity trust:** neither Google endpoint ever trusts a browser-supplied email, name,
+  subject, or profile field as authoritative — the only trusted identity is what comes back from a
+  successful cryptographic verification (`completeGoogleLogin` for the redirect flow,
+  `verifyGoogleIdToken` for the ID-token endpoint), and a client-supplied `userId` is never
+  accepted anywhere in this service; the session's own user is always the one the server just
+  resolved.
 - **Error responses:** never expose stack traces, SQL, provider secrets, or internal topology
   (verified by `test/integration/healthAndMisc.test.ts`).
 - **Headers:** `@fastify/helmet` with CSP disabled (this service only ever serves JSON, matching

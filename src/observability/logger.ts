@@ -14,6 +14,7 @@ const REDACT_PATHS = [
   '*.otp',
   '*.otpCode',
   '*.internalServiceKey',
+  '*.credential',
 ];
 
 export function createLogger(env: Pick<Env, 'LOG_LEVEL' | 'NODE_ENV'>) {

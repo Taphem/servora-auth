@@ -3,6 +3,7 @@ import type { AppContext } from '../app/context.js';
 import { registerInternalSessionsVerifyRoute } from './internal/v1/sessionsVerify.js';
 import { registerEmailResendRoute } from './v1/auth/emailResend.js';
 import { registerEmailVerifyRoute } from './v1/auth/emailVerify.js';
+import { registerGoogleAuthenticateRoute } from './v1/auth/googleAuthenticate.js';
 import { registerGoogleCallbackRoute } from './v1/auth/googleCallback.js';
 import { registerGoogleStartRoute } from './v1/auth/googleStart.js';
 import { registerLoginRoute } from './v1/auth/login.js';
@@ -25,6 +26,7 @@ export function registerRoutes(app: FastifyInstance, ctx: AppContext): void {
   registerPhoneOtpVerifyRoute(app, ctx);
   registerGoogleStartRoute(app, ctx);
   registerGoogleCallbackRoute(app, ctx);
+  registerGoogleAuthenticateRoute(app, ctx);
   registerPasswordResetRequestRoute(app, ctx);
   registerPasswordResetConfirmRoute(app, ctx);
 

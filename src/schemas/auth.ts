@@ -63,3 +63,13 @@ export const internalSessionVerifyBodySchema = z.object({
   sessionToken: z.string().min(1).max(1024),
 });
 export type InternalSessionVerifyBody = z.infer<typeof internalSessionVerifyBodySchema>;
+
+// The Google ID token itself (a JWT) — a bare credential obtained directly
+// by the frontend via Google Identity Services, not an authorization code.
+// No other identity fields are accepted here; everything trusted about the
+// caller comes only from what verifyGoogleIdToken extracts after
+// cryptographic verification (see oauth/googleIdTokenVerifier.ts).
+export const googleAuthenticateBodySchema = z.object({
+  credential: z.string().min(1).max(4096),
+});
+export type GoogleAuthenticateBody = z.infer<typeof googleAuthenticateBodySchema>;

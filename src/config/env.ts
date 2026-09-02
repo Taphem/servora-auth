@@ -96,7 +96,14 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env) {
     isProduction,
     isTest: env.NODE_ENV === 'test',
     sessionCookieSecure,
+    // Full three-var config needed for the authorization-code redirect
+    // flow (google/start + google/callback).
     googleOAuthConfigured: Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET && env.GOOGLE_REDIRECT_URI),
+    // The POST /api/v1/auth/google ID-token flow only ever needs the
+    // client ID (it's the verification audience, not a secret, and there's
+    // no redirect involved) — reuses the same GOOGLE_CLIENT_ID rather than
+    // introducing a second variable.
+    googleIdTokenVerificationConfigured: Boolean(env.GOOGLE_CLIENT_ID),
     notificationConfigured: Boolean(env.NOTIFICATION_SERVICE_URL),
   };
 }
