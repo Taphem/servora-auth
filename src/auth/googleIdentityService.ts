@@ -8,6 +8,12 @@ import type { GoogleIdentity } from '../oauth/googleClient.js';
 
 const GOOGLE_PROVIDER = 'google';
 
+export interface ResolvedGoogleUser {
+  user: User;
+  /** True only when this call just created the account — callers use this to fire AccountCreated vs. AuthLogin (never both); see notifications/events.ts. */
+  isNewAccount: boolean;
+}
+
 /**
  * Resolves a verified Google identity to a Servora user: an existing
  * linked account, an existing password account with a matching *verified*
@@ -17,7 +23,7 @@ const GOOGLE_PROVIDER = 'google';
  * Google but still requires separate phone verification before the
  * account is "ready" — this function never touches phone_verified_at.
  */
-export async function resolveOrCreateUserForGoogleIdentity(pool: DbPool, identity: GoogleIdentity): Promise<User> {
+export async function resolveOrCreateUserForGoogleIdentity(pool: DbPool, identity: GoogleIdentity): Promise<ResolvedGoogleUser> {
   const existingLink = await findOAuthIdentity(pool, GOOGLE_PROVIDER, identity.subject);
   if (existingLink) {
     const user = await findUserById(pool, existingLink.userId);
@@ -28,7 +34,7 @@ export async function resolveOrCreateUserForGoogleIdentity(pool: DbPool, identit
         message: 'Google authentication failed.',
       });
     }
-    return user;
+    return { user, isNewAccount: false };
   }
 
   if (!identity.emailVerified) {
@@ -49,7 +55,10 @@ export async function resolveOrCreateUserForGoogleIdentity(pool: DbPool, identit
     if (!existingUser.emailVerifiedAt) {
       await markEmailVerified(pool, existingUser.id);
     }
-    return { ...existingUser, emailVerifiedAt: existingUser.emailVerifiedAt ?? new Date() };
+    return {
+      user: { ...existingUser, emailVerifiedAt: existingUser.emailVerifiedAt ?? new Date() },
+      isNewAccount: false,
+    };
   }
 
   const newUser = await insertUser(pool, {
@@ -64,5 +73,5 @@ export async function resolveOrCreateUserForGoogleIdentity(pool: DbPool, identit
     provider: GOOGLE_PROVIDER,
     providerSubjectId: identity.subject,
   });
-  return newUser;
+  return { user: newUser, isNewAccount: true };
 }

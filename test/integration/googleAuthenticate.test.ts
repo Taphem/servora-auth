@@ -158,7 +158,43 @@ describe.skipIf(!isInfraAvailable())('POST /api/v1/auth/google (ID-token "Contin
   it('does not send a phone OTP or require a phone for a new Google user', async () => {
     mockGooglePayload({ sub: 'google-sub-no-otp', email: 'no-otp-check@example.com', email_verified: true });
     await postGoogle('valid.jwt.token');
-    expect(testApp.notifications.events).toHaveLength(0);
+    expect(testApp.notifications.events.some((e) => e.type === 'PhoneOtpRequested')).toBe(false);
+  });
+
+  it('a new Google identity triggers exactly one AccountCreated event, with authenticationMethod=google, and no AuthLogin', async () => {
+    mockGooglePayload({ sub: 'google-sub-account-created-event', email: 'account-created-event@example.com', email_verified: true });
+    const response = await postGoogle('valid.jwt.token');
+    expect(response.statusCode).toBe(200);
+
+    expect(testApp.notifications.events).toHaveLength(1);
+    expect(testApp.notifications.events[0]).toMatchObject({
+      type: 'AccountCreated',
+      userId: response.json().userId,
+      email: 'account-created-event@example.com',
+      authenticationMethod: 'google',
+      emailVerified: true,
+    });
+    expect(testApp.notifications.events.some((e) => e.type === 'AuthLogin')).toBe(false);
+  });
+
+  it('an existing (already-linked) Google identity triggers AuthLogin with authenticationMethod=google, not AccountCreated', async () => {
+    mockGooglePayload({ sub: 'google-sub-auth-login-event', email: 'auth-login-event@example.com', email_verified: true });
+    const first = await postGoogle('token-1');
+    expect(first.statusCode).toBe(200);
+    testApp.notifications.clear();
+
+    mockGooglePayload({ sub: 'google-sub-auth-login-event', email: 'auth-login-event@example.com', email_verified: true });
+    const second = await postGoogle('token-2');
+    expect(second.statusCode).toBe(200);
+
+    expect(testApp.notifications.events).toHaveLength(1);
+    expect(testApp.notifications.events[0]).toMatchObject({
+      type: 'AuthLogin',
+      userId: second.json().userId,
+      email: 'auth-login-event@example.com',
+      authenticationMethod: 'google',
+    });
+    expect(testApp.notifications.events.some((e) => e.type === 'AccountCreated')).toBe(false);
   });
 
   it('authenticates (not duplicates) an already-linked Google identity on a second call', async () => {
@@ -205,6 +241,10 @@ describe.skipIf(!isInfraAvailable())('POST /api/v1/auth/google (ID-token "Contin
     });
     expect(registerResponse.statusCode).toBe(201);
     const existingUserId = registerResponse.json().userId;
+    // The setup registration above already published its own
+    // AccountCreated (password) — clear it so the assertion below only
+    // reflects what the Google call itself produced.
+    testApp.notifications.clear();
 
     mockGooglePayload({ sub: 'google-sub-link-to-password', email: 'password-first@example.com', email_verified: true });
     const googleResponse = await postGoogle('link-token');
@@ -226,6 +266,13 @@ describe.skipIf(!isInfraAvailable())('POST /api/v1/auth/google (ID-token "Contin
     // Google's verified email establishes Servora email verification too.
     const emailVerifiedRow = await testApp.ctx.pool.query('SELECT email_verified_at FROM users WHERE id = $1', [existingUserId]);
     expect(emailVerifiedRow.rows[0].email_verified_at).not.toBeNull();
+
+    // No Servora account was newly created here — linking to an existing
+    // account is a login, not an account-creation event.
+    const authEvents = testApp.notifications.events.filter((e) => e.type === 'AccountCreated' || e.type === 'AuthLogin');
+    expect(authEvents).toEqual([
+      expect.objectContaining({ type: 'AuthLogin', userId: existingUserId, authenticationMethod: 'google' }),
+    ]);
   });
 
   it('sets the session cookie with the same attributes as normal login', async () => {

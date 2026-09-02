@@ -205,51 +205,103 @@ Missing or incorrect `x-servora-internal-key` is a `401 INTERNAL_AUTH_FAILED` (n
 
 This is documented here, in this repository, as instructed — `servora-docs` was not modified.
 
-## Notification integration boundary — CONFIRMED contract
+## Notification integration boundary
 
 `servora-notification` is deployed and its internal HTTP contract is documented in that
-repository (`servora-notification/docs/api.md`, `docs/integration.md`). This service's outbound
-side (`src/notifications/`) was updated to match it exactly — it is no longer a proposal:
+repository (`servora-notification/docs/api.md`, `docs/integration.md`). Three of the five event
+types below are **CONFIRMED** against that documented contract; two (account/login notifications)
+are **PROPOSED** — servora-notification does not implement them yet, and this repository does not
+modify that one, per the multi-repo boundary.
 
 - `NotificationPublisher` — the interface every call site depends on (`publish(event)`),
   unchanged by this update.
-- `NotificationEvent` (`src/notifications/events.ts`) — three internal TypeScript-only shapes
-  (`EmailVerificationRequested`, `PhoneOtpRequested`, `PasswordResetRequested`); `type` and
-  `requestId` are never sent in the outbound body — see `notificationRequest.ts`.
+- `NotificationEvent` (`src/notifications/events.ts`) — five internal TypeScript-only shapes;
+  `type` and `requestId` are never sent in the outbound body — see `notificationRequest.ts`.
 - `toNotificationHttpRequest` (`src/notifications/notificationRequest.ts`) — pure mapping from an
-  internal event to the exact `{ path, body }` servora-notification documents for each of its
-  three resource-oriented endpoints:
+  internal event to the exact `{ path, body }`:
 
-  | Auth-side trigger | Call into servora-notification | Body |
-  |---|---|---|
-  | `POST /register`, `POST /email/resend` | `POST /internal/v1/notifications/email-verification` | `{ userId, email, verificationToken }` |
-  | `POST /password/reset/request` | `POST /internal/v1/notifications/password-reset` | `{ userId, email, resetToken }` |
-  | `POST /phone/otp/request` | `POST /internal/v1/notifications/phone-otp` | `{ userId, phone, otp, expiresInSeconds }` |
+  | Auth-side trigger | Call into servora-notification | Body | Status |
+  |---|---|---|---|
+  | `POST /register`, `POST /email/resend` | `POST /internal/v1/notifications/email-verification` | `{ userId, email, verificationToken }` | CONFIRMED |
+  | `POST /password/reset/request` | `POST /internal/v1/notifications/password-reset` | `{ userId, email, resetToken }` | CONFIRMED |
+  | `POST /phone/otp/request` | `POST /internal/v1/notifications/phone-otp` | `{ userId, phone, otp, expiresInSeconds }` | CONFIRMED |
+  | New account (password registration or a brand-new Google identity) | `POST /internal/v1/notifications/account-created` | `{ userId, email, authenticationMethod, emailVerified }` | **PROPOSED** |
+  | Successful login (password, or Google resolving to an existing account) | `POST /internal/v1/notifications/auth-login` | `{ userId, email, authenticationMethod }` | **PROPOSED** |
+
+  `authenticationMethod` is `"password"` or `"google"`. The two proposed paths/bodies follow the
+  exact same resource-oriented, kebab-case, type-less-body convention as the three confirmed ones,
+  for consistency — but until servora-notification implements them, calling either just gets a
+  `404` from that service, which `HttpNotificationPublisher` already treats like any other
+  rejected call (logged, swallowed, never thrown — see below). No account-creation or login
+  emails are actually delivered today; the events are dispatched and safely ignored.
 
 - `HttpNotificationPublisher` — sends `x-servora-internal-key: <INTERNAL_SERVICE_KEY>` (the same
   shared secret used on the internal session-verify endpoint) and `x-request-id: <requestId>` on
   every call, to `${NOTIFICATION_SERVICE_URL}<path>`. Success is `202 { accepted: true }`. A
   non-2xx response, an unreachable service, or a malformed/unexpected response body is logged as a
   warning (HTTP status, servora-notification's own error `code` when present, event type, request
-  ID) and **swallowed, never thrown** — the token/OTP is already durably persisted in Postgres
-  before this call happens, so a delivery failure never blocks or fails the calling auth flow; the
-  user can always retry via `/email/resend` or a fresh `/phone/otp/request`. Never logged, under
+  ID) and **swallowed, never thrown** — every trigger point below calls `publish()` with no
+  try/catch of its own, relying entirely on this non-throwing contract (verified directly by
+  `test/integration/notificationFailureIsolation.test.ts` against an unreachable/timing-out/500
+  target, not just at the publisher-unit level). For the three confirmed events specifically, the
+  token/OTP is already durably persisted in Postgres before the call happens, so a delivery
+  failure never blocks the calling auth flow and the user can always retry. Never logged, under
   any outcome: `INTERNAL_SERVICE_KEY`, the raw token/OTP, or the request/response body.
 - `NullNotificationPublisher` — used when `NOTIFICATION_SERVICE_URL` is unset. The verification/
-  reset challenge is still created and persisted in Postgres; it just isn't delivered anywhere. A
-  warning is logged (event type + request ID only, never the payload). This mirrors the API
-  Gateway's own `DOWNSTREAM_NOT_CONFIGURED` honesty pattern.
+  reset challenge (or account/session, for the two proposed events) is still created as normal; it
+  just isn't delivered anywhere. A warning is logged (event type + request ID only, never the
+  payload). This mirrors the API Gateway's own `DOWNSTREAM_NOT_CONFIGURED` honesty pattern.
 - `InMemoryNotificationPublisher` — test double; used throughout `test/integration/` to assert on
   exactly what would have been sent, without a network call.
 
-**History:** this was previously a PROPOSED, unconfirmed contract — a single generic
-`POST {baseUrl}/internal/v1/events` endpoint with a `type`-discriminated envelope, no internal-auth
-header, and `expiresAt` ISO timestamps. `servora-notification` was built independently to its own
-specified contract (three resource-oriented endpoints, `x-servora-internal-key` required,
-`expiresInSeconds` for the OTP flow — a deliberate, more security-conscious choice on that
-repository's part, documented in its `docs/integration.md` "Known contract mismatch" section as of
-before this update). This service has now been updated to match that contract exactly, rather than
-the other way around — `servora-notification` was not modified as part of this work.
+### Auth/account notification events (PROPOSED)
+
+`AccountCreated` and `AuthLogin` exist to let servora-notification eventually send a welcome email
+and a "new sign-in to your account" email. Trigger rules, all enforced at the exact point each
+operation has *actually* succeeded (session created), never earlier and never on failure:
+
+- **Password registration** (`POST /register`) — publishes `EmailVerificationRequested` (existing,
+  unchanged) **and** `AccountCreated` (`authenticationMethod: "password"`, `emailVerified: false`
+  — a fresh password account's email is never implied verified). These are two distinct,
+  non-duplicative notifications, not a replacement of one by the other.
+- **Google authentication resolving to a brand-new account** (either `POST /google` or the
+  `google/start`+`/callback` redirect flow) — publishes `AccountCreated`
+  (`authenticationMethod: "google"`, `emailVerified: true`, since Google's own verification
+  already established it) and explicitly does **not** send `EmailVerificationRequested` (there is
+  nothing to verify) or any phone OTP.
+- **Password login** (`POST /login`) — publishes `AuthLogin` (`authenticationMethod: "password"`)
+  only after the password has actually verified and the account isn't locked/disabled. A failed
+  attempt (wrong password, unknown email, locked/disabled account) never publishes anything.
+- **Google authentication resolving to an existing account** (either Google endpoint) — publishes
+  `AuthLogin` (`authenticationMethod: "google"`), never `AccountCreated`. This is exactly the same
+  code path whether the browser was showing a Login or Signup page — the endpoint has no
+  login/signup mode to begin with (see "Google authentication"), so which event fires is
+  determined solely by `resolveOrCreateUserForGoogleIdentity`'s `isNewAccount` result, never by
+  which page the request conceptually came from.
+- **`GET /api/v1/auth/session`** — never publishes anything, under any circumstance. This is the
+  one rule most worth stating explicitly: a session *check* (page load, `AuthProvider` refresh,
+  navigation, an auth modal opening) must never be mistaken for a new authentication event. Tested
+  directly (`test/integration/registerLogin.test.ts`, repeated session checks asserted to produce
+  zero notification events).
+
+No new duplicate-suppression infrastructure was added beyond what already exists: `AccountCreated`
+can only ever fire once per identity because account creation itself is a one-time, uniquely-
+constrained database operation (a second attempt to "create" the same account resolves to the
+existing-account branch and fires `AuthLogin` instead, never a second `AccountCreated`) — this
+falls directly out of the existing schema, not a new mechanism. A login notification firing once
+per genuinely successful `POST /login` (including one triggered by a frontend double-click that
+results in two real, distinct successful requests) is considered correct, not a duplicate — each
+represents an actual new session.
+
+**History:** the three confirmed events were previously a PROPOSED, unconfirmed contract — a
+single generic `POST {baseUrl}/internal/v1/events` endpoint with a `type`-discriminated envelope,
+no internal-auth header, and `expiresAt` ISO timestamps. `servora-notification` was built
+independently to its own specified contract (three resource-oriented endpoints,
+`x-servora-internal-key` required, `expiresInSeconds` for the OTP flow — a deliberate, more
+security-conscious choice on that repository's part, documented in its `docs/integration.md`
+"Known contract mismatch" section as of before that update). This service was updated to match
+that contract exactly, rather than the other way around — `servora-notification` was not modified
+as part of that work, and is not modified as part of this one either.
 
 ## Database schema
 

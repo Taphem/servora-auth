@@ -36,16 +36,26 @@ describe.skipIf(!isInfraAvailable())('register + login + logout + session', () =
     const sessionCookie = getCookieValue(response, testApp.ctx.env.SESSION_COOKIE_NAME);
     expect(sessionCookie).toBeTruthy();
 
-    expect(testApp.notifications.events).toHaveLength(1);
-    const event = testApp.notifications.events[0];
-    expect(event).toMatchObject({
-      type: 'EmailVerificationRequested',
+    // Registration publishes two distinct notifications: the verification
+    // email (existing behavior) plus a separate welcome/account-created
+    // event (see notifications/events.ts AccountCreatedEvent) — never a
+    // duplicate of one another.
+    expect(testApp.notifications.events).toHaveLength(2);
+
+    const verificationEvent = testApp.notifications.events.find((e) => e.type === 'EmailVerificationRequested');
+    expect(verificationEvent).toMatchObject({ userId: body.userId, email: 'alice@example.com' });
+    expect(typeof (verificationEvent as { verificationToken?: unknown }).verificationToken).toBe('string');
+    // Matches servora-notification's documented request body exactly — no expiresAt field.
+    expect(verificationEvent).not.toHaveProperty('expiresAt');
+
+    const accountCreatedEvent = testApp.notifications.events.find((e) => e.type === 'AccountCreated');
+    expect(accountCreatedEvent).toMatchObject({
       userId: body.userId,
       email: 'alice@example.com',
+      authenticationMethod: 'password',
+      // A fresh password account's email is never implied verified.
+      emailVerified: false,
     });
-    expect(typeof (event as { verificationToken?: unknown }).verificationToken).toBe('string');
-    // Matches servora-notification's documented request body exactly — no expiresAt field.
-    expect(event).not.toHaveProperty('expiresAt');
   });
 
   it('registration without a phone stores no phone number on the account (NULL, not a placeholder)', async () => {
@@ -118,12 +128,13 @@ describe.skipIf(!isInfraAvailable())('register + login + logout + session', () =
     expect(response.json().error.code).toBe('VALIDATION_FAILED');
   });
 
-  it('rejects a duplicate email registration', async () => {
+  it('rejects a duplicate email registration and publishes no AccountCreated event for the failed attempt', async () => {
     await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/register',
       payload: { email: 'dup@example.com', password: 'correct-horse-battery' },
     });
+    testApp.notifications.clear();
 
     const second = await testApp.app.inject({
       method: 'POST',
@@ -133,6 +144,7 @@ describe.skipIf(!isInfraAvailable())('register + login + logout + session', () =
 
     expect(second.statusCode).toBe(409);
     expect(second.json().error.code).toBe('EMAIL_ALREADY_REGISTERED');
+    expect(testApp.notifications.events.some((e) => e.type === 'AccountCreated')).toBe(false);
   });
 
   it('never returns a password hash anywhere in the response body', async () => {
@@ -145,11 +157,13 @@ describe.skipIf(!isInfraAvailable())('register + login + logout + session', () =
   });
 
   it('logs in with correct credentials and rejects incorrect ones identically', async () => {
-    await testApp.app.inject({
+    const register = await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/register',
       payload: { email: 'carol@example.com', password: 'correct-horse-battery' },
     });
+    const userId = register.json().userId;
+    testApp.notifications.clear();
 
     const wrongPassword = await testApp.app.inject({
       method: 'POST',
@@ -169,6 +183,9 @@ describe.skipIf(!isInfraAvailable())('register + login + logout + session', () =
     expect(wrongPassword.json().error.code).toBe('INVALID_CREDENTIALS');
     expect(nonExistentUser.json().error.code).toBe('INVALID_CREDENTIALS');
 
+    // Neither failed attempt published an AuthLogin event.
+    expect(testApp.notifications.events).toHaveLength(0);
+
     const correct = await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/login',
@@ -176,6 +193,38 @@ describe.skipIf(!isInfraAvailable())('register + login + logout + session', () =
     });
     expect(correct.statusCode).toBe(200);
     expect(getCookieValue(correct, testApp.ctx.env.SESSION_COOKIE_NAME)).toBeTruthy();
+
+    // The successful login — and only the successful login — published AuthLogin.
+    expect(testApp.notifications.events).toHaveLength(1);
+    expect(testApp.notifications.events[0]).toMatchObject({
+      type: 'AuthLogin',
+      userId,
+      email: 'carol@example.com',
+      authenticationMethod: 'password',
+    });
+  });
+
+  it('does not publish AuthLogin on GET /api/v1/auth/session — session checks are not authentication events', async () => {
+    const registerResponse = await testApp.app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/register',
+      payload: { email: 'session-check-no-event@example.com', password: 'correct-horse-battery' },
+    });
+    const cookie = getCookieValue(registerResponse, testApp.ctx.env.SESSION_COOKIE_NAME)!;
+    testApp.notifications.clear();
+
+    // Simulate repeated session checks — page loads, AuthProvider refresh,
+    // navigation between pages, an auth modal opening/closing.
+    for (let i = 0; i < 3; i++) {
+      const response = await testApp.app.inject({
+        method: 'GET',
+        url: '/api/v1/auth/session',
+        cookies: { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookie },
+      });
+      expect(response.json().authenticated).toBe(true);
+    }
+
+    expect(testApp.notifications.events).toHaveLength(0);
   });
 
   it('reports session state via GET /api/v1/auth/session', async () => {
@@ -227,12 +276,13 @@ describe.skipIf(!isInfraAvailable())('register + login + logout + session', () =
     // oauth/googleClient.ts for that). Confirms this task's optional-phone
     // change didn't accidentally make phone.optional() only apply to the
     // password registration path.
-    const user = await resolveOrCreateUserForGoogleIdentity(testApp.ctx.pool, {
+    const { user, isNewAccount } = await resolveOrCreateUserForGoogleIdentity(testApp.ctx.pool, {
       subject: 'google-subject-no-phone-test',
       email: 'google-user-no-phone@example.com',
       emailVerified: true,
     });
 
+    expect(isNewAccount).toBe(true);
     expect(user.phone).toBeNull();
     expect(user.phoneVerifiedAt).toBeNull();
     expect(user.emailVerifiedAt).not.toBeNull();

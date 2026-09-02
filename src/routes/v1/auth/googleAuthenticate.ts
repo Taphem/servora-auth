@@ -20,6 +20,8 @@ import { googleAuthenticateBodySchema } from '../../../schemas/auth.js';
  * never part of the request — resolveOrCreateUserForGoogleIdentity (shared
  * with the redirect flow) already finds-or-creates-or-links purely from
  * the verified Google identity, with no signup/login distinction to break.
+ * The AccountCreated-vs-AuthLogin notification fired below follows that
+ * same resolution, never the page the browser was showing.
  */
 export function registerGoogleAuthenticateRoute(app: FastifyInstance, ctx: AppContext): void {
   app.post('/api/v1/auth/google', async (request, reply) => {
@@ -35,7 +37,7 @@ export function registerGoogleAuthenticateRoute(app: FastifyInstance, ctx: AppCo
 
     const identity = await verifyGoogleIdToken(ctx.env.GOOGLE_CLIENT_ID!, body.credential);
 
-    const user = await resolveOrCreateUserForGoogleIdentity(ctx.pool, identity);
+    const { user, isNewAccount } = await resolveOrCreateUserForGoogleIdentity(ctx.pool, identity);
 
     const { rawToken } = await createSession(ctx.pool, {
       userId: user.id,
@@ -43,6 +45,30 @@ export function registerGoogleAuthenticateRoute(app: FastifyInstance, ctx: AppCo
       userAgent: request.headers['user-agent'] ?? null,
       ip: request.ip,
     });
+
+    // Fired only once session creation has actually succeeded — i.e. only
+    // for a genuinely completed authentication, never a failed one. Exactly
+    // one of the two, never both (see events.ts AccountCreatedEvent /
+    // AuthLoginEvent).
+    if (isNewAccount) {
+      await ctx.notificationPublisher.publish({
+        type: 'AccountCreated',
+        requestId: request.id,
+        userId: user.id,
+        email: user.email,
+        authenticationMethod: 'google',
+        emailVerified: user.emailVerifiedAt !== null,
+      });
+    } else {
+      await ctx.notificationPublisher.publish({
+        type: 'AuthLogin',
+        requestId: request.id,
+        userId: user.id,
+        email: user.email,
+        authenticationMethod: 'google',
+      });
+    }
+
     setSessionCookie(reply, ctx.env, rawToken);
 
     return {

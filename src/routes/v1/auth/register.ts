@@ -77,6 +77,20 @@ export function registerRegisterRoute(app: FastifyInstance, ctx: AppContext): vo
       verificationToken: rawToken,
     });
 
+    // Additional to (not a replacement for) the verification email above —
+    // a separate welcome/account-created notification. emailVerified is
+    // always false here (registration never auto-verifies a password
+    // account's email), so servora-notification never gets told to imply
+    // otherwise. See notifications/events.ts AccountCreatedEvent.
+    await ctx.notificationPublisher.publish({
+      type: 'AccountCreated',
+      requestId: request.id,
+      userId: user.id,
+      email: user.email,
+      authenticationMethod: 'password',
+      emailVerified: false,
+    });
+
     const { rawToken: sessionToken } = await createSession(ctx.pool, {
       userId: user.id,
       ttlSeconds: ctx.env.SESSION_TTL_SECONDS,

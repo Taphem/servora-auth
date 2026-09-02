@@ -57,6 +57,20 @@ export function registerLoginRoute(app: FastifyInstance, ctx: AppContext): void 
       userAgent: request.headers['user-agent'] ?? null,
       ip: request.ip,
     });
+
+    // Only reached after session creation actually succeeded — i.e. only
+    // for a genuinely completed login, never a failed attempt (both
+    // credential checks above throw and return early on failure) and
+    // never for GET /api/v1/auth/session, which never touches
+    // notificationPublisher at all. See notifications/events.ts AuthLoginEvent.
+    await ctx.notificationPublisher.publish({
+      type: 'AuthLogin',
+      requestId: request.id,
+      userId: user.id,
+      email: user.email,
+      authenticationMethod: 'password',
+    });
+
     setSessionCookie(reply, ctx.env, rawToken);
 
     return {

@@ -5,6 +5,7 @@ import { loadEnv } from '../../src/config/env.js';
 import { createPool } from '../../src/db/pool.js';
 import { createLogger } from '../../src/observability/logger.js';
 import { InMemoryNotificationPublisher } from '../../src/notifications/InMemoryNotificationPublisher.js';
+import type { NotificationPublisher } from '../../src/notifications/NotificationPublisher.js';
 import { createRedisClient } from '../../src/redis/client.js';
 
 export const TEST_INTERNAL_SERVICE_KEY = 'test-internal-service-key-at-least-32-chars-long';
@@ -46,6 +47,52 @@ export function buildTestApp(envOverrides: Record<string, string> = {}): TestApp
     app,
     ctx,
     notifications,
+    close: async () => {
+      await app.close();
+      await pool.end();
+      redis.disconnect();
+    },
+  };
+}
+
+export interface CustomPublisherTestApp {
+  app: FastifyInstance;
+  ctx: AppContext;
+  close: () => Promise<void>;
+}
+
+/**
+ * Like buildTestApp, but with a caller-supplied NotificationPublisher
+ * instead of the default InMemory one — for tests that need to exercise a
+ * *failing* publisher (unreachable/timeout/5xx) and confirm the auth
+ * endpoints still succeed regardless (see
+ * test/integration/notificationFailureIsolation.test.ts). No `.notifications`
+ * capture here since the publisher isn't necessarily an in-memory one.
+ */
+export function buildTestAppWithPublisher(
+  notificationPublisher: NotificationPublisher,
+  envOverrides: Record<string, string> = {},
+): CustomPublisherTestApp {
+  const env = loadEnv({
+    ...process.env,
+    NODE_ENV: 'test',
+    DATABASE_URL: process.env['TEST_DATABASE_URL'] ?? process.env['DATABASE_URL'] ?? '',
+    REDIS_URL: process.env['TEST_REDIS_URL'] ?? process.env['REDIS_URL'] ?? '',
+    INTERNAL_SERVICE_KEY: TEST_INTERNAL_SERVICE_KEY,
+    LOG_LEVEL: 'silent',
+    ...envOverrides,
+  });
+
+  const pool = createPool(env.DATABASE_URL);
+  const redis = createRedisClient(env.REDIS_URL);
+  const logger = createLogger(env);
+
+  const ctx: AppContext = { env, pool, redis, logger, notificationPublisher };
+  const app = buildApp(ctx);
+
+  return {
+    app,
+    ctx,
     close: async () => {
       await app.close();
       await pool.end();

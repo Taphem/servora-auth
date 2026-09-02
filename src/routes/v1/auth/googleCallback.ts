@@ -36,7 +36,7 @@ export function registerGoogleCallbackRoute(app: FastifyInstance, ctx: AppContex
       callbackUrl,
     );
 
-    const user = await resolveOrCreateUserForGoogleIdentity(ctx.pool, identity);
+    const { user, isNewAccount } = await resolveOrCreateUserForGoogleIdentity(ctx.pool, identity);
 
     const { rawToken } = await createSession(ctx.pool, {
       userId: user.id,
@@ -44,6 +44,29 @@ export function registerGoogleCallbackRoute(app: FastifyInstance, ctx: AppContex
       userAgent: request.headers['user-agent'] ?? null,
       ip: request.ip,
     });
+
+    // Same rule as the ID-token endpoint (googleAuthenticate.ts): exactly
+    // one of AccountCreated/AuthLogin, decided purely by identity
+    // resolution, fired only after session creation has succeeded.
+    if (isNewAccount) {
+      await ctx.notificationPublisher.publish({
+        type: 'AccountCreated',
+        requestId: request.id,
+        userId: user.id,
+        email: user.email,
+        authenticationMethod: 'google',
+        emailVerified: user.emailVerifiedAt !== null,
+      });
+    } else {
+      await ctx.notificationPublisher.publish({
+        type: 'AuthLogin',
+        requestId: request.id,
+        userId: user.id,
+        email: user.email,
+        authenticationMethod: 'google',
+      });
+    }
+
     setSessionCookie(reply, ctx.env, rawToken);
 
     reply.code(302).redirect(ctx.env.OAUTH_POST_LOGIN_REDIRECT_URL);
