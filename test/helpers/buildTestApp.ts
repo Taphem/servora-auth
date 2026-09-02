@@ -48,11 +48,19 @@ export function buildTestApp(): TestApp {
 }
 
 export async function resetDatabase(ctx: AppContext): Promise<void> {
+  // otp_challenges is included even though the application no longer
+  // writes to it (phone OTP challenges now live in Redis — see
+  // src/redis/otpChallenge.ts) — the table itself was intentionally kept
+  // in the schema, unused, rather than dropped.
   await ctx.pool.query(
     'TRUNCATE otp_challenges, password_reset_tokens, email_verification_tokens, sessions, oauth_identities, users RESTART IDENTITY CASCADE',
   );
 }
 
 export async function flushRedis(ctx: AppContext): Promise<void> {
+  // FLUSHDB is fine here: this is a disposable, test-only Redis instance
+  // (TEST_REDIS_URL), never the production/dev instance — see
+  // scripts/reset-auth-data.ts for the production-safe, prefix-scoped
+  // equivalent used against a real environment.
   await ctx.redis.flushdb();
 }

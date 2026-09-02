@@ -1,7 +1,6 @@
 import type {
   EmailVerificationToken,
   OAuthIdentity,
-  OtpChallenge,
   PasswordResetToken,
   Session,
   User,
@@ -106,34 +105,6 @@ export function mapPasswordResetTokenRow(row: TokenRow): PasswordResetToken {
     id: row.id,
     userId: row.user_id,
     tokenHash: row.token_hash,
-    expiresAt: row.expires_at,
-    consumedAt: row.consumed_at,
-    createdAt: row.created_at,
-  };
-}
-
-interface OtpChallengeRow {
-  id: string;
-  user_id: string;
-  phone: string;
-  otp_hash: string;
-  purpose: string;
-  attempt_count: number;
-  max_attempts: number;
-  expires_at: Date;
-  consumed_at: Date | null;
-  created_at: Date;
-}
-
-export function mapOtpChallengeRow(row: OtpChallengeRow): OtpChallenge {
-  return {
-    id: row.id,
-    userId: row.user_id,
-    phone: row.phone,
-    otpHash: row.otp_hash,
-    purpose: row.purpose,
-    attemptCount: row.attempt_count,
-    maxAttempts: row.max_attempts,
     expiresAt: row.expires_at,
     consumedAt: row.consumed_at,
     createdAt: row.created_at,

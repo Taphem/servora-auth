@@ -266,7 +266,10 @@ ORM — see `migrations/0001_init.sql` for the full DDL. Six tables, all Auth-ow
 - **`email_verification_tokens`**, **`password_reset_tokens`** — `token_hash` (SHA-256, unique),
   `expires_at`, `consumed_at` (single-use).
 - **`otp_challenges`** — `otp_hash` (SHA-256), `phone`, `attempt_count`/`max_attempts`,
-  `expires_at`, `consumed_at`.
+  `expires_at`, `consumed_at`. **Present in the schema but no longer written to by the
+  application** — phone OTP challenges moved to Redis (see "Phone OTP flow" and "Redis usage"
+  below). The table was deliberately kept rather than dropped, so it remains part of the schema
+  history untouched; nothing reads or writes it today.
 
 Never persisted in plaintext, anywhere: passwords, session tokens, verification tokens, OTPs,
 reset tokens — only their SHA-256 (tokens/OTPs) or Argon2id (passwords) form. See "Security" for
@@ -364,17 +367,42 @@ same generic response whether or not the account exists or is already verified.
 
 ## Phone OTP flow
 
-Requires an authenticated session (deliberate — see "Authentication flows"). `POST
-/phone/otp/request` accepts `{ phone }`, generates a cryptographically random numeric OTP
-(`crypto.randomInt`, default 6 digits), stores only its SHA-256 hash with `max_attempts` (default
-5) and a short TTL (default 5 min), and publishes a `PhoneOtpRequested` event. `POST
-/phone/otp/verify` compares via constant-time comparison of the hashes
-(`src/security/compare.ts`), increments `attempt_count` on mismatch, and once attempts are
-exhausted returns `429 OTP_ATTEMPTS_EXCEEDED` (not `400`) requiring a fresh `/request`. On success,
-`phone` is only written to `users.phone` at this point — never reserved earlier — so a phone
-number can't be squatted by starting-but-never-completing verification; a `23505` unique-violation
-race against another account claiming the same number is caught and mapped to `409
-PHONE_ALREADY_REGISTERED`.
+Requires an authenticated session (deliberate — see "Authentication flows"). The OTP challenge
+itself lives entirely in Redis, not Postgres (`src/redis/otpChallenge.ts`) — per
+`servora-docs/02-architecture/database-architecture.md` ("Redis is for cache/rate
+limits/temporary state/idempotency/counters/locks where justified"), a short-lived, inherently
+TTL-bound challenge is exactly that kind of temporary state, so Redis's own `EX` TTL provides
+expiry for free instead of a separate expired-row cleanup job.
+
+`POST /phone/otp/request` accepts `{ phone }`, generates a cryptographically random numeric OTP
+(`crypto.randomInt`, default 6 digits), and `SET`s a single Redis key
+(`otp:phone:challenge:<userId>`, see "Redis usage") holding its SHA-256 hash, the phone number
+being verified, and `attempts: 0`/`maxAttempts`, with an `EX` of `OTP_TTL_SECONDS`. Requesting a
+new OTP simply overwrites this key — the old code stops working immediately, and only ever the
+latest challenge per user exists. A `PhoneOtpRequested` event is published carrying the raw OTP
+(see "Notification integration boundary").
+
+`POST /phone/otp/verify` submits only `{ otp }` — the phone number being verified is read back
+from the stored challenge, never re-trusted from the client. Verification runs as a single atomic
+Redis Lua script (`VERIFY_OTP_SCRIPT` in `src/redis/otpChallenge.ts`): it checks the attempt
+counter, compares the submitted OTP's hash, and then either deletes the key (success — single-use)
+or increments the attempt counter (wrong guess), all as one indivisible operation. This is what
+makes concurrent verification race-safe: Redis executes Lua scripts single-threaded, so two
+simultaneous requests submitting the same correct OTP are fully serialized — the first to reach
+Redis deletes the key and succeeds, the second observes it already gone and gets
+`400 OTP_NOT_REQUESTED`, never a second success (covered by
+`test/integration/phoneOtp.test.ts`'s concurrency test). Once attempts are exhausted the script
+deletes the challenge outright and returns `429 OTP_ATTEMPTS_EXCEEDED` — even the correct OTP
+stops working at that point, requiring a fresh `/request`. On success, `phone` is only written to
+`users.phone` at this point — never reserved earlier — so a phone number can't be squatted by
+starting-but-never-completing verification; a `23505` unique-violation race against another
+account claiming the same number is caught and mapped to `409 PHONE_ALREADY_REGISTERED`.
+
+The OTP comparison inside the script uses ordinary (not constant-time) equality on two SHA-256 hex
+digests, not the raw OTP — deliberately: hash-to-hash timing cannot leak information about the
+preimage due to the avalanche effect, unlike comparing a raw secret's characters directly. The
+actual brute-force defense for a 6-digit OTP is the atomic attempt counter and the surrounding
+resend cooldown/rate limits (unchanged from before this redesign), not comparison timing.
 
 ## Internal service authentication
 
@@ -411,17 +439,73 @@ never reach a browser, frontend build, or public log line.
 
 ## Redis usage
 
-Non-authoritative only, per ADR-003 and `database-architecture.md`: rate-limit counters
-(`src/redis/rateLimiter.ts`), resend/OTP cooldowns (`src/redis/cooldown.ts`), and short-lived
-Google OAuth state (`src/oauth/googleOAuthState.ts`, 10-minute TTL, single-use). No correctness
-invariant depends solely on Redis — a flushed Redis instance degrades rate limiting/cooldowns to
-"temporarily permissive," never breaks authentication, session validity, or verification state
-(all of which live only in Postgres).
+Non-authoritative for everything *except* the phone OTP challenge itself, per ADR-003 and
+`database-architecture.md` ("temporary state ... where justified"):
+
+| Key pattern | Purpose | TTL |
+|---|---|---|
+| `ratelimit:<endpoint>:<ip\|email\|user>:<value>` | Fixed-window rate-limit counters (`src/redis/rateLimiter.ts`) | per-endpoint window |
+| `cooldown:<endpoint>:<userId>` | Resend cooldowns (`src/redis/cooldown.ts`) | per-endpoint cooldown |
+| `oauth:google:state:<state>` | Google OAuth PKCE/nonce state, single-use (`src/oauth/googleOAuthState.ts`) | 10 min |
+| `otp:phone:challenge:<userId>` | Phone OTP challenge — hash, phone, attempts (`src/redis/otpChallenge.ts`) | `OTP_TTL_SECONDS` |
+
+A flushed Redis instance degrades rate limiting/cooldowns to "temporarily permissive" and — unlike
+before this redesign — would also silently invalidate any in-flight (unverified) phone OTP
+challenge, requiring the user to request a new one; it never breaks authentication, session
+validity, or already-completed email/phone verification state (all of which live only in
+Postgres). This is a deliberate, scoped exception to "Redis is never authoritative for core
+business data": a still-pending, minutes-lived OTP challenge is not durable state anyone depends
+on surviving a Redis outage — losing one only costs the user a re-request.
+
+`scripts/reset-auth-data.ts` (see "Development data reset" below) only ever deletes keys under
+these exact four prefixes, scanned and named explicitly (`SCAN` + `UNLINK`) — never `FLUSHDB`/
+`FLUSHALL` — so anything outside them is structurally impossible for it to touch.
 
 **Bloom filter:** not implemented. `servora-docs/02-architecture/database-architecture.md`
 describes it as an optional future accelerator for email/phone existence checks, explicitly
 conditioned on a measurable reason and a clean invalidation strategy — neither exists at this
 scale, so it was left out rather than added speculatively.
+
+## Development data reset
+
+`scripts/reset-auth-data.ts` (`npm run reset-auth-data`) deletes **all rows** from every
+auth-owned Postgres table and **all keys** under the four Redis prefixes listed above — schema,
+migrations, indexes, and constraints are never touched. This is a deliberate full reset for a
+development database, not a test-data-detection tool: every account in this service's database
+was created during development, so there is nothing to selectively preserve.
+
+```bash
+npm run reset-auth-data                                            # dry run (default) — reports counts, deletes nothing
+npm run reset-auth-data -- --execute --confirm=DELETE-ALL-AUTH-DATA  # actually delete
+```
+
+Safety properties, all enforced in `scripts/resetAuthDataCore.ts` (exercised directly by
+`test/integration/resetAuthData.test.ts`, including against real concurrent/production-guard
+scenarios):
+
+- **Dry run by default.** `--execute` alone does nothing destructive.
+- **Explicit confirmation required.** `--execute` without `--confirm=DELETE-ALL-AUTH-DATA` (exact
+  string) refuses and explains why.
+- **Production-refusing.** Refuses to run destructively when `NODE_ENV=production` unless
+  `ALLOW_PRODUCTION_DESTRUCTIVE_RESET=I-UNDERSTAND-THIS-DELETES-PRODUCTION-DATA` (exact value) is
+  also set — a second, independent, deliberately unwieldy override from the `--confirm` flag.
+- **Transactional in Postgres.** All table deletes run inside one `BEGIN`/`COMMIT`; any failure
+  rolls back everything.
+- **FK-safe, schema-aware.** Deletes children before `users` in a fixed order; checks
+  `information_schema.tables` first so it degrades gracefully if a table is ever added or removed
+  later, rather than assuming the table list.
+- **Redis: named prefixes only, never FLUSHDB/FLUSHALL.** Every key deleted is first enumerated by
+  `SCAN` against one of the four known prefixes, then removed by `UNLINK` (non-blocking) — a key
+  outside those prefixes cannot be deleted by this script even if this Redis instance ever holds
+  unrelated data.
+- **Verifies its own result.** After executing, re-counts every table and re-scans every Redis
+  prefix and reports whether zero remain — this is not just assumed from the delete call's row
+  count.
+- **No public HTTP endpoint.** This is a local/CI-invoked script only, never routed.
+
+Sequences are inspected (`information_schema.sequences`) and reported but not touched — this
+schema uses only UUID primary keys (`gen_random_uuid()`), so none exist; a future serial/identity
+column would show up here rather than being silently ignored.
 
 ## Environment variables
 

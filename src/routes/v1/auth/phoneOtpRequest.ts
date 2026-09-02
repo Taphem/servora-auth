@@ -2,12 +2,12 @@ import type { FastifyInstance } from 'fastify';
 import type { AppContext } from '../../../app/context.js';
 import { requireSession } from '../../../auth/requireSession.js';
 import { RATE_LIMITS } from '../../../config/rateLimits.js';
-import { insertOtpChallenge } from '../../../db/queries/otpChallenges.js';
 import { findUserByPhone } from '../../../db/queries/users.js';
 import { AppError } from '../../../errors/AppError.js';
 import { ErrorCode } from '../../../errors/errorCodes.js';
 import { tryAcquireCooldown } from '../../../redis/cooldown.js';
 import { enforceRateLimit } from '../../../redis/guard.js';
+import { storeOtpChallenge } from '../../../redis/otpChallenge.js';
 import { phoneOtpRequestBodySchema } from '../../../schemas/auth.js';
 import { generateOtp, hashOtp } from '../../../security/otp.js';
 
@@ -59,15 +59,17 @@ export function registerPhoneOtpRequestRoute(app: FastifyInstance, ctx: AppConte
       });
     }
 
+    // Requesting a new OTP simply overwrites any prior challenge for this
+    // user (same Redis key) — the old code becomes unusable immediately,
+    // and Redis's own TTL retires the new one automatically; no separate
+    // expired-row cleanup is needed (see redis/otpChallenge.ts).
     const otp = generateOtp(ctx.env.OTP_LENGTH);
-    const expiresAt = new Date(Date.now() + ctx.env.OTP_TTL_SECONDS * 1000);
-    await insertOtpChallenge(ctx.pool, {
-      userId: user.id,
-      phone: body.phone,
-      otpHash: hashOtp(otp),
-      expiresAt,
-      maxAttempts: ctx.env.OTP_MAX_ATTEMPTS,
-    });
+    await storeOtpChallenge(
+      ctx.redis,
+      user.id,
+      { otpHash: hashOtp(otp), phone: body.phone, maxAttempts: ctx.env.OTP_MAX_ATTEMPTS },
+      ctx.env.OTP_TTL_SECONDS,
+    );
 
     await ctx.notificationPublisher.publish({
       type: 'PhoneOtpRequested',

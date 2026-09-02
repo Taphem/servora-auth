@@ -65,16 +65,3 @@ export interface PasswordResetToken {
   consumedAt: Date | null;
   createdAt: Date;
 }
-
-export interface OtpChallenge {
-  id: string;
-  userId: string;
-  phone: string;
-  otpHash: string;
-  purpose: string;
-  attemptCount: number;
-  maxAttempts: number;
-  expiresAt: Date;
-  consumedAt: Date | null;
-  createdAt: Date;
-}

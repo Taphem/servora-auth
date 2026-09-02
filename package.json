@@ -18,7 +18,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "migrate": "tsx --env-file-if-exists=.env scripts/migrate.ts"
+    "migrate": "tsx --env-file-if-exists=.env scripts/migrate.ts",
+    "reset-auth-data": "tsx --env-file-if-exists=.env scripts/reset-auth-data.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
