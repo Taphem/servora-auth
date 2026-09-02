@@ -9,6 +9,11 @@ const phone = z.string().trim().regex(/^\+[1-9]\d{7,14}$/, 'Phone must be in E.1
 export const registerBodySchema = z.object({
   email,
   password,
+  // Optional by product decision: an account must be fully usable with only
+  // email + password. When supplied, normalized/validated the same as the
+  // phone OTP flow's own input. Backward compatible with any existing
+  // client that only ever sent { email, password }.
+  phone: phone.optional(),
 });
 export type RegisterBody = z.infer<typeof registerBodySchema>;
 
@@ -28,9 +33,14 @@ export const emailResendBodySchema = z.object({
 });
 export type EmailResendBody = z.infer<typeof emailResendBodySchema>;
 
-export const phoneOtpRequestBodySchema = z.object({
-  phone,
-});
+// Deliberately takes no phone field: the phone number OTP is sent to always
+// comes from the authenticated user's own stored account data (see
+// routes/v1/auth/phoneOtpRequest.ts), never from the request body — a
+// session must not be usable to request an OTP to an arbitrary phone
+// number. `.strict()` rejects a body that includes an unexpected `phone`
+// key outright (400 VALIDATION_FAILED) rather than silently ignoring it,
+// as defense in depth on top of the route never reading it.
+export const phoneOtpRequestBodySchema = z.object({}).strict();
 export type PhoneOtpRequestBody = z.infer<typeof phoneOtpRequestBodySchema>;
 
 export const phoneOtpVerifyBodySchema = z.object({

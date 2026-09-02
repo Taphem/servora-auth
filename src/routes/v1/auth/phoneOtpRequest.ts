@@ -14,7 +14,12 @@ import { generateOtp, hashOtp } from '../../../security/otp.js';
 export function registerPhoneOtpRequestRoute(app: FastifyInstance, ctx: AppContext): void {
   app.post('/api/v1/auth/phone/otp/request', async (request) => {
     const { user } = await requireSession(request, ctx);
-    const body = phoneOtpRequestBodySchema.parse(request.body);
+    // No phone in the body by design — parsing still runs (and, via
+    // .strict(), rejects a body that tries to smuggle one in) even though
+    // the result is discarded. The OTP destination is never anything but
+    // this account's own stored phone; a session must not be usable to
+    // request an OTP to an arbitrary number.
+    phoneOtpRequestBodySchema.parse(request.body ?? {});
 
     if (user.phoneVerifiedAt) {
       throw new AppError({
@@ -24,7 +29,21 @@ export function registerPhoneOtpRequestRoute(app: FastifyInstance, ctx: AppConte
       });
     }
 
-    const existingOwner = await findUserByPhone(ctx.pool, body.phone);
+    if (!user.phone) {
+      throw new AppError({
+        statusCode: 400,
+        code: ErrorCode.PHONE_NOT_SET,
+        message: 'No phone number is set on this account.',
+      });
+    }
+    const phone = user.phone;
+
+    // Defense-in-depth: since phone is now written to `users` (unverified)
+    // at registration and `users_phone_unique` is a hard DB constraint, no
+    // other account can already hold this exact value — this check is
+    // unreachable through any current flow, but kept in case that
+    // registration-time guarantee is ever relaxed by a future change.
+    const existingOwner = await findUserByPhone(ctx.pool, phone);
     if (existingOwner && existingOwner.id !== user.id && existingOwner.phoneVerifiedAt) {
       throw new AppError({
         statusCode: 409,
@@ -67,7 +86,7 @@ export function registerPhoneOtpRequestRoute(app: FastifyInstance, ctx: AppConte
     await storeOtpChallenge(
       ctx.redis,
       user.id,
-      { otpHash: hashOtp(otp), phone: body.phone, maxAttempts: ctx.env.OTP_MAX_ATTEMPTS },
+      { otpHash: hashOtp(otp), phone, maxAttempts: ctx.env.OTP_MAX_ATTEMPTS },
       ctx.env.OTP_TTL_SECONDS,
     );
 
@@ -75,7 +94,7 @@ export function registerPhoneOtpRequestRoute(app: FastifyInstance, ctx: AppConte
       type: 'PhoneOtpRequested',
       requestId: request.id,
       userId: user.id,
-      phone: body.phone,
+      phone,
       otp,
       expiresInSeconds: ctx.env.OTP_TTL_SECONDS,
     });

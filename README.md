@@ -133,14 +133,14 @@ Public API is served under `/api/v1/`, per `servora-docs/09-api/versioning.md`. 
 
 | Method & path | Auth required | Notes |
 |---|---|---|
-| `POST /register` | — | Creates the account, auto-creates a session, and requests email verification |
+| `POST /register` | — | Body: `{ email, password, phone? }` — **`phone` is optional**. Creates the account, auto-creates a session, and requests email verification |
 | `POST /login` | — | Generic `INVALID_CREDENTIALS` for both unknown email and wrong password |
 | `POST /logout` | session cookie (optional) | Always `204`, idempotent |
 | `GET /session` | — | `200 { authenticated: false }` when no/invalid session, never `401` |
 | `POST /email/verify` | — | Body: `{ token }`. Single-use |
 | `POST /email/resend` | — | Body: `{ email }`. Identical generic response whether or not the account exists |
-| `POST /phone/otp/request` | session cookie | Body: `{ phone }` |
-| `POST /phone/otp/verify` | session cookie | Body: `{ otp }` |
+| `POST /phone/otp/request` | session cookie | Body: `{}` — **no `phone` field**; the destination number is always the account's own stored phone (`400 PHONE_NOT_SET` if none) |
+| `POST /phone/otp/verify` | session cookie | Body: `{ otp }` — no `phone` field; derived from the pending challenge |
 | `GET /google/start` | — | 302 redirect to Google, or `503 GOOGLE_OAUTH_NOT_CONFIGURED` |
 | `GET /google/callback` | — | 302 redirect to `OAUTH_POST_LOGIN_REDIRECT_URL` on success |
 | `POST /password/reset/request` | — | Body: `{ email }`. Identical generic response either way |
@@ -255,9 +255,13 @@ the other way around — `servora-notification` was not modified as part of this
 PostgreSQL is authoritative (`servora-docs/02-architecture/database-architecture.md`, ADR-002). No
 ORM — see `migrations/0001_init.sql` for the full DDL. Six tables, all Auth-owned:
 
-- **`users`** — `id`, `email` (unique, `citext`), `phone` (unique, nullable — only set once
-  verified), `password_hash` (nullable — Google-only accounts have none), `role`, `status`,
-  `email_verified_at`, `phone_verified_at`, timestamps.
+- **`users`** — `id`, `email` (unique, `citext`), `phone` (unique, **nullable — optional at
+  registration**; Postgres treats multiple `NULL`s as distinct, so any number of accounts can have
+  no phone at all, no schema change was needed to support this), `password_hash` (nullable —
+  Google-only accounts have none), `role`, `status`, `email_verified_at`, `phone_verified_at`,
+  timestamps. A non-null `phone` is stored as soon as it's supplied (registration or the phone OTP
+  flow) but is not implied to be *verified* — only `phone_verified_at` means that; see
+  "Authentication flows".
 - **`oauth_identities`** — links a `user_id` to `(provider, provider_subject_id)`, unique per
   provider+subject.
 - **`sessions`** — `session_token_hash` (SHA-256 of the raw cookie value, unique), `expires_at`,
@@ -307,20 +311,28 @@ a same-site embedding scenario is ever introduced.
 
 ## Authentication flows
 
-**Registration → email verification → phone OTP → account ready.** Registration only collects
-email + password; phone is supplied later, at `POST /phone/otp/request` — this unifies the
-password and Google registration paths (Google never supplies a phone number) instead of forcing
-phone collection at signup. `email_verified_at`/`phone_verified_at` are never set automatically;
-`markEmailVerified`/`markPhoneVerified` only run after their respective token/OTP is actually
-validated.
+**Phone number is optional, by product decision.** An account is fully usable — register, login,
+session, email verification — with only email + password; nothing in this service invents,
+defaults, or later demands a phone number. `POST /register` accepts an optional `phone` field
+(`{ email, password, phone? }`); when supplied it's validated (E.164) and stored on the account
+immediately, but **never marked verified by registration itself** — `phone_verified_at` is only
+ever set by a completed OTP verification (`markPhoneVerified`), never as a side effect of
+registering, verifying email, or Google-authenticating. When omitted, `phone` is `NULL` — not an
+empty string, not a placeholder. A user without a phone can request one be added only through the
+existing phone OTP flow once authenticated (there is no separate "add phone" endpoint — see "Phone
+OTP flow"); a future Profile/Account Settings feature is expected to be the primary way users add
+one after the fact, which is out of scope here.
 
-**Login** does not require prior verification to succeed — it establishes a session and honestly
-reports `emailVerified`/`phoneVerified` in the response so the frontend/gateway can gate access to
-protected functionality. This is a deliberate reading of the approved design: verification itself
-(`/email/resend`, `/phone/otp/request`) needs an identified account to act on, so login has to
-remain reachable pre-verification, or a user could never complete verification at all. "Not fully
-ready" is enforced by what the *rest of the platform* does with `emailVerified`/`phoneVerified`,
-not by blocking authentication outright.
+**Login** does not require prior verification to succeed, and does not require a phone number to
+exist on the account at all — it establishes a session and honestly reports
+`emailVerified`/`phoneVerified` (`false` when no phone is set, exactly as when one is set but
+unverified — indistinguishable from the login/session response alone) so the frontend/gateway can
+gate access to protected functionality. This is a deliberate reading of the approved design:
+verification itself (`/email/resend`, `/phone/otp/request`) needs an identified account to act on,
+so login has to remain reachable pre-verification, or a user could never complete verification at
+all. "Not fully ready" is enforced by what the *rest of the platform* does with
+`emailVerified`/`phoneVerified`, not by blocking authentication outright, and never by requiring a
+phone number.
 
 **Account enumeration:** `/login` returns identical `401 INVALID_CREDENTIALS` for "no such
 account" and "wrong password" (verified by `test/integration/registerLogin.test.ts`), and both
@@ -343,10 +355,11 @@ never a mock. `resolveOrCreateUserForGoogleIdentity` (`src/auth/googleIdentitySe
    email → **auto-link** (safe because Google's `email_verified` claim is trustworthy) and mark
    the account's email verified if it wasn't already — "don't ask users to verify an email Google
    already authenticated."
-3. Else → create a brand-new Google-only account (`password_hash: null`,
-   `email_verified_at: now()`, **`phone_verified_at: null`**). Per the approved design, a
-   Google-created account still must complete phone verification separately before being
-   considered fully ready — this function never touches `phone_verified_at`.
+3. Else → create a brand-new Google-only account (`password_hash: null`, `phone: null`,
+   `email_verified_at: now()`, `phone_verified_at: null`) — Google never supplies a phone number,
+   and none is invented; this function never touches `phone`/`phone_verified_at` at all. Phone
+   remains entirely optional here exactly as for password registration (see "Authentication
+   flows") — a Google account is never required to add or verify one.
 4. If Google reports `email_verified: false`, linking/account-creation is refused outright
    (`401 GOOGLE_OAUTH_FAILED`) rather than trusting an unverified email.
 
@@ -374,13 +387,20 @@ limits/temporary state/idempotency/counters/locks where justified"), a short-liv
 TTL-bound challenge is exactly that kind of temporary state, so Redis's own `EX` TTL provides
 expiry for free instead of a separate expired-row cleanup job.
 
-`POST /phone/otp/request` accepts `{ phone }`, generates a cryptographically random numeric OTP
-(`crypto.randomInt`, default 6 digits), and `SET`s a single Redis key
-(`otp:phone:challenge:<userId>`, see "Redis usage") holding its SHA-256 hash, the phone number
-being verified, and `attempts: 0`/`maxAttempts`, with an `EX` of `OTP_TTL_SECONDS`. Requesting a
-new OTP simply overwrites this key — the old code stops working immediately, and only ever the
-latest challenge per user exists. A `PhoneOtpRequested` event is published carrying the raw OTP
-(see "Notification integration boundary").
+`POST /phone/otp/request` takes **`{}` — no `phone` field**. The phone number an OTP is sent to is
+always the authenticated user's own stored `users.phone`, read server-side; the request body is
+validated with a `.strict()` zod schema that *rejects* a body containing an unexpected `phone` key
+outright (`400 VALIDATION_FAILED`) rather than silently ignoring it. This is deliberate, not
+incidental: a session must never be usable to redirect an OTP to a phone number the caller doesn't
+own, and there is no server-side trust placed in anything the client sends here. If the account has
+no phone number at all, the request fails with `400 PHONE_NOT_SET` — the backend never invents one
+and never silently succeeds. Once a phone is confirmed present, the route generates a
+cryptographically random numeric OTP (`crypto.randomInt`, default 6 digits) and `SET`s a single
+Redis key (`otp:phone:challenge:<userId>`, see "Redis usage") holding its SHA-256 hash, the phone
+number, and `attempts: 0`/`maxAttempts`, with an `EX` of `OTP_TTL_SECONDS`. Requesting a new OTP
+simply overwrites this key — the old code stops working immediately, and only ever the latest
+challenge per user exists. A `PhoneOtpRequested` event is published carrying the raw OTP (see
+"Notification integration boundary").
 
 `POST /phone/otp/verify` submits only `{ otp }` — the phone number being verified is read back
 from the stored challenge, never re-trusted from the client. Verification runs as a single atomic
@@ -393,10 +413,17 @@ Redis deletes the key and succeeds, the second observes it already gone and gets
 `400 OTP_NOT_REQUESTED`, never a second success (covered by
 `test/integration/phoneOtp.test.ts`'s concurrency test). Once attempts are exhausted the script
 deletes the challenge outright and returns `429 OTP_ATTEMPTS_EXCEEDED` — even the correct OTP
-stops working at that point, requiring a fresh `/request`. On success, `phone` is only written to
-`users.phone` at this point — never reserved earlier — so a phone number can't be squatted by
-starting-but-never-completing verification; a `23505` unique-violation race against another
-account claiming the same number is caught and mapped to `409 PHONE_ALREADY_REGISTERED`.
+stops working at that point, requiring a fresh `/request`.
+
+**Phone uniqueness:** `users.phone` is written as soon as a phone is supplied — at registration, or
+by a completed OTP verification — under the same `users_phone_unique` database constraint either
+way, so two accounts can never simultaneously hold the same non-null phone value, verified or not
+(Postgres treats multiple `NULL`s as distinct, so this never affects accounts with no phone). A
+duplicate at registration is rejected with `409 PHONE_ALREADY_REGISTERED` before the account is
+even created. Both `phoneOtpRequest.ts`'s `findUserByPhone` ownership check and
+`phoneOtpVerify.ts`'s `users_phone_unique` violation catch are consequently unreachable through any
+flow available today — kept as defense-in-depth in case that registration-time guarantee is ever
+relaxed by a future change, not because either is currently load-bearing.
 
 The OTP comparison inside the script uses ordinary (not constant-time) equality on two SHA-256 hex
 digests, not the raw OTP — deliberately: hash-to-hash timing cannot leak information about the
@@ -544,3 +571,6 @@ plus a separate job building the Docker image. It does not deploy anywhere.
 - The API Gateway does not yet send `x-servora-internal-key` — that repository was not modified as
   part of this work (see "Internal session verification").
 - No CSRF token scheme beyond `SameSite=Lax` — see "Session / cookie architecture."
+- No "add/change phone number" endpoint for an already-registered account — a phone can only be
+  set at registration today. A future Profile/Account Settings feature is expected to add one;
+  deliberately not built here (see "Authentication flows").

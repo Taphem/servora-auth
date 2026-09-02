@@ -62,6 +62,10 @@ export function registerPhoneOtpVerifyRoute(app: FastifyInstance, ctx: AppContex
       throw INVALID_OTP_ERROR;
     }
 
+    // The unique-violation catch below is the last-resort ownership check
+    // for this exact write; see the equivalent comment in
+    // phoneOtpRequest.ts for why it's currently unreachable in practice
+    // (phone is unique across `users` from registration onward) but kept.
     await markPhoneVerified(ctx.pool, user.id, result.phone).catch((error: unknown) => {
       if (isUniqueViolation(error) && error.constraint === 'users_phone_unique') {
         throw new AppError({

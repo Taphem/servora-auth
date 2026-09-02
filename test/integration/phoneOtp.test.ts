@@ -22,11 +22,12 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
     await testApp.close();
   });
 
-  async function registerAndGetCookie(email: string) {
+  /** Phone (if given) is supplied at registration — the OTP request contract no longer accepts one. */
+  async function registerAndGetCookie(email: string, phone?: string) {
     const response = await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/register',
-      payload: { email, password: 'correct-horse-battery' },
+      payload: phone ? { email, password: 'correct-horse-battery', phone } : { email, password: 'correct-horse-battery' },
     });
     testApp.notifications.clear();
     return getCookieValue(response, testApp.ctx.env.SESSION_COOKIE_NAME)!;
@@ -36,26 +37,57 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
     const response = await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/phone/otp/request',
-      payload: { phone: '+14155551234' },
+      payload: {},
     });
     expect(response.statusCode).toBe(401);
     expect(response.json().error.code).toBe('UNAUTHENTICATED');
   });
 
-  it('requests and verifies an OTP, marking the phone verified', async () => {
-    const cookie = await registerAndGetCookie('phone-user@example.com');
+  it('rejects a request whose body tries to supply a phone number — the account phone is always used instead', async () => {
+    const cookie = await registerAndGetCookie('otp-no-client-phone@example.com', '+14155551234');
+    const response = await testApp.app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/phone/otp/request',
+      cookies: { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookie },
+      // An attacker-controlled body trying to redirect the OTP to a phone
+      // number they don't own. The schema's .strict() must reject this
+      // outright rather than silently ignoring the extra field.
+      payload: { phone: '+19995550000' },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe('VALIDATION_FAILED');
+    // And no challenge/notification was created for the attacker-supplied number.
+    expect(testApp.notifications.events).toHaveLength(0);
+  });
+
+  it('returns PHONE_NOT_SET when the account has no phone number at all', async () => {
+    const cookie = await registerAndGetCookie('otp-no-phone-on-account@example.com');
+    const response = await testApp.app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/phone/otp/request',
+      cookies: { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookie },
+      payload: {},
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe('PHONE_NOT_SET');
+    expect(testApp.notifications.events).toHaveLength(0);
+  });
+
+  it('requests and verifies an OTP for the phone supplied at registration, marking it verified', async () => {
+    const cookie = await registerAndGetCookie('phone-user@example.com', '+14155551234');
     const cookieHeader = { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookie };
 
     const requestResponse = await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/phone/otp/request',
       cookies: cookieHeader,
-      payload: { phone: '+14155551234' },
+      payload: {},
     });
     expect(requestResponse.statusCode).toBe(200);
 
     const event = testApp.notifications.events[0] as PhoneOtpRequestedEvent;
     expect(event.type).toBe('PhoneOtpRequested');
+    expect(event.phone).toBe('+14155551234');
     expect(event.otp).toMatch(/^\d{6}$/);
     // Matches servora-notification's documented phone-otp request body: expiresInSeconds, not expiresAt.
     expect(event.expiresInSeconds).toBe(testApp.ctx.env.OTP_TTL_SECONDS);
@@ -79,14 +111,14 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
   });
 
   it('rejects an incorrect OTP and enforces the attempt limit', async () => {
-    const cookie = await registerAndGetCookie('otp-attempts@example.com');
+    const cookie = await registerAndGetCookie('otp-attempts@example.com', '+14155559999');
     const cookieHeader = { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookie };
 
     await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/phone/otp/request',
       cookies: cookieHeader,
-      payload: { phone: '+14155559999' },
+      payload: {},
     });
 
     const maxAttempts = testApp.ctx.env.OTP_MAX_ATTEMPTS;
@@ -104,34 +136,36 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
     expect(lastResponse?.json().error.code).toBe('OTP_ATTEMPTS_EXCEEDED');
   });
 
-  it('rejects claiming a phone number already verified on another account', async () => {
-    const cookieA = await registerAndGetCookie('owner-a@example.com');
-    const headerA = { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookieA };
-    await testApp.app.inject({ method: 'POST', url: '/api/v1/auth/phone/otp/request', cookies: headerA, payload: { phone: '+14155550001' } });
-    const eventA = testApp.notifications.events.at(-1) as PhoneOtpRequestedEvent;
-    await testApp.app.inject({ method: 'POST', url: '/api/v1/auth/phone/otp/verify', cookies: headerA, payload: { otp: eventA.otp } });
-
-    const cookieB = await registerAndGetCookie('owner-b@example.com');
-    const headerB = { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookieB };
-    const response = await testApp.app.inject({
+  it('rejects registering a phone number already claimed by another account', async () => {
+    // This is now the actual enforcement point for phone ownership: since
+    // phone is written to `users` (unverified) at registration itself and
+    // `users_phone_unique` is a hard database constraint, two accounts can
+    // never simultaneously hold the same phone value — verified or not.
+    // The defensive ownership re-check inside phoneOtpRequest.ts/
+    // phoneOtpVerify.ts (findUserByPhone / the users_phone_unique catch)
+    // is accordingly unreachable through any real flow today; it's kept
+    // as defense-in-depth per the task's explicit "preserve the existing
+    // uniqueness/security behavior" requirement, in case that registration-
+    // time guarantee is ever relaxed by a future change.
+    await registerAndGetCookie('dup-phone-first@example.com', '+14155550099');
+    const secondResponse = await testApp.app.inject({
       method: 'POST',
-      url: '/api/v1/auth/phone/otp/request',
-      cookies: headerB,
-      payload: { phone: '+14155550001' },
+      url: '/api/v1/auth/register',
+      payload: { email: 'dup-phone-second@example.com', password: 'correct-horse-battery', phone: '+14155550099' },
     });
-    expect(response.statusCode).toBe(409);
-    expect(response.json().error.code).toBe('PHONE_ALREADY_REGISTERED');
+    expect(secondResponse.statusCode).toBe(409);
+    expect(secondResponse.json().error.code).toBe('PHONE_ALREADY_REGISTERED');
   });
 
   it('stores the OTP challenge in Redis with a hashed OTP, a TTL, and never the raw OTP', async () => {
-    const cookie = await registerAndGetCookie('otp-storage-check@example.com');
+    const cookie = await registerAndGetCookie('otp-storage-check@example.com', '+14155552222');
     const cookieHeader = { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookie };
 
     const requestResponse = await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/phone/otp/request',
       cookies: cookieHeader,
-      payload: { phone: '+14155552222' },
+      payload: {},
     });
     expect(requestResponse.statusCode).toBe(200);
 
@@ -155,7 +189,7 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
   });
 
   it('rejects verification when no OTP was ever requested', async () => {
-    const cookie = await registerAndGetCookie('otp-none-requested@example.com');
+    const cookie = await registerAndGetCookie('otp-none-requested@example.com', '+14155553001');
     const response = await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/phone/otp/verify',
@@ -167,14 +201,14 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
   });
 
   it('rejects an expired OTP the same way as one that was never requested', async () => {
-    const cookie = await registerAndGetCookie('otp-expired@example.com');
+    const cookie = await registerAndGetCookie('otp-expired@example.com', '+14155553333');
     const cookieHeader = { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookie };
 
     const requestResponse = await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/phone/otp/request',
       cookies: cookieHeader,
-      payload: { phone: '+14155553333' },
+      payload: {},
     });
     expect(requestResponse.statusCode).toBe(200);
     const event = testApp.notifications.events[0] as PhoneOtpRequestedEvent;
@@ -196,14 +230,14 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
   });
 
   it('cannot reuse a successfully-verified OTP a second time', async () => {
-    const cookie = await registerAndGetCookie('otp-no-reuse@example.com');
+    const cookie = await registerAndGetCookie('otp-no-reuse@example.com', '+14155554444');
     const cookieHeader = { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookie };
 
     await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/phone/otp/request',
       cookies: cookieHeader,
-      payload: { phone: '+14155554444' },
+      payload: {},
     });
     const event = testApp.notifications.events[0] as PhoneOtpRequestedEvent;
 
@@ -226,14 +260,14 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
   });
 
   it('invalidates the challenge once attempts are exhausted — even the correct OTP fails afterward', async () => {
-    const cookie = await registerAndGetCookie('otp-exhausted-then-correct@example.com');
+    const cookie = await registerAndGetCookie('otp-exhausted-then-correct@example.com', '+14155555555');
     const cookieHeader = { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookie };
 
     await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/phone/otp/request',
       cookies: cookieHeader,
-      payload: { phone: '+14155555555' },
+      payload: {},
     });
     const event = testApp.notifications.events[0] as PhoneOtpRequestedEvent;
 
@@ -259,14 +293,14 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
   });
 
   it('enforces the resend cooldown, then allows a resend once it has passed', async () => {
-    const cookie = await registerAndGetCookie('otp-cooldown@example.com');
+    const cookie = await registerAndGetCookie('otp-cooldown@example.com', '+14155556666');
     const cookieHeader = { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookie };
 
     const first = await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/phone/otp/request',
       cookies: cookieHeader,
-      payload: { phone: '+14155556666' },
+      payload: {},
     });
     expect(first.statusCode).toBe(200);
     expect(testApp.notifications.events).toHaveLength(1);
@@ -275,7 +309,7 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
       method: 'POST',
       url: '/api/v1/auth/phone/otp/request',
       cookies: cookieHeader,
-      payload: { phone: '+14155556666' },
+      payload: {},
     });
     expect(immediateResend.statusCode).toBe(429);
     expect(testApp.notifications.events).toHaveLength(1);
@@ -289,14 +323,14 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
       method: 'POST',
       url: '/api/v1/auth/phone/otp/request',
       cookies: cookieHeader,
-      payload: { phone: '+14155556666' },
+      payload: {},
     });
     expect(afterCooldown.statusCode).toBe(200);
     expect(testApp.notifications.events).toHaveLength(2);
   });
 
   it('rate-limits excessive OTP verification attempts by IP', async () => {
-    const cookie = await registerAndGetCookie('otp-verify-ratelimit@example.com');
+    const cookie = await registerAndGetCookie('otp-verify-ratelimit@example.com', '+14155558001');
     const cookieHeader = { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookie };
     const limit = RATE_LIMITS.otpVerifyByIp.limit;
 
@@ -317,14 +351,14 @@ describe.skipIf(!isInfraAvailable())('phone OTP verification', () => {
   });
 
   it('does not allow two concurrent requests to both consume the same correct OTP (race safety)', async () => {
-    const cookie = await registerAndGetCookie('otp-concurrency@example.com');
+    const cookie = await registerAndGetCookie('otp-concurrency@example.com', '+14155557777');
     const cookieHeader = { [testApp.ctx.env.SESSION_COOKIE_NAME]: cookie };
 
     await testApp.app.inject({
       method: 'POST',
       url: '/api/v1/auth/phone/otp/request',
       cookies: cookieHeader,
-      payload: { phone: '+14155557777' },
+      payload: {},
     });
     const event = testApp.notifications.events[0] as PhoneOtpRequestedEvent;
 

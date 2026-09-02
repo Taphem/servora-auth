@@ -37,7 +37,13 @@ export function registerRegisterRoute(app: FastifyInstance, ctx: AppContext): vo
 
     const user = await insertUser(ctx.pool, {
       email: body.email,
-      phone: null,
+      // Optional by product decision — an account must be fully usable
+      // with only email + password. Never invented/defaulted to a
+      // placeholder; NULL when omitted (see migrations/0001_init.sql,
+      // which already allows NULL phone and treats it as distinct from
+      // any other NULL for the unique constraint — standard Postgres
+      // semantics, no migration needed for this feature).
+      phone: body.phone ?? null,
       passwordHash,
       role: 'CUSTOMER',
       emailVerifiedAt: null,
@@ -47,6 +53,13 @@ export function registerRegisterRoute(app: FastifyInstance, ctx: AppContext): vo
           statusCode: 409,
           code: ErrorCode.EMAIL_ALREADY_REGISTERED,
           message: 'An account with this email already exists.',
+        });
+      }
+      if (isUniqueViolation(error) && error.constraint === 'users_phone_unique') {
+        throw new AppError({
+          statusCode: 409,
+          code: ErrorCode.PHONE_ALREADY_REGISTERED,
+          message: 'This phone number is already registered to another account.',
         });
       }
       throw error;
